@@ -11,7 +11,6 @@ import androidx.lifecycle.viewModelScope
 import jadx.api.JadxArgs
 import jadx.api.JadxDecompiler
 import jadx.api.JavaClass
-import jadx.api.ResourceType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -24,6 +23,20 @@ sealed interface Stage {
     data class Loading(val message: String) : Stage
     data object Browse : Stage
     data class Error(val message: String) : Stage
+}
+
+/** Teks error lengkap: rantai penyebab + sebagian stack trace, supaya gampang dilaporkan. */
+fun describe(t: Throwable): String = buildString {
+    var cur: Throwable? = t
+    var depth = 0
+    while (cur != null && depth < 6) {
+        if (depth > 0) append("Caused by: ")
+        append(cur.javaClass.name).append(": ").append(cur.message).append('\n')
+        cur.stackTrace.take(8).forEach { append("    at ").append(it).append('\n') }
+        val next = cur.cause
+        cur = if (next === cur) null else next
+        depth++
+    }
 }
 
 class DecompilerViewModel(app: Application) : AndroidViewModel(app) {
@@ -42,11 +55,34 @@ class DecompilerViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var installed by mutableStateOf<List<AppEntry>>(emptyList())
         private set
+    /** Terisi kalau XML parser jadx gagal init di HP ini (resource jadx dimatikan). */
+    var xmlWarning by mutableStateOf<String?>(null)
+        private set
 
     private var jadx: JadxDecompiler? = null
     private var classMap: Map<String, JavaClass> = emptyMap()
+    private var apkFile: File? = null
 
     private val ctx get() = getApplication<Application>()
+
+    companion object {
+        private var xmlChecked = false
+        private var xmlProblem: String? = null
+
+        /** Dicek sekali per proses supaya penyebab aslinya (bukan NoClassDefFoundError lanjutan) tersimpan. */
+        private fun xmlSecurityProblem(): String? {
+            if (!xmlChecked) {
+                xmlProblem = try {
+                    Class.forName("jadx.core.xmlgen.XmlSecurity")
+                    null
+                } catch (t: Throwable) {
+                    describe(t)
+                }
+                xmlChecked = true
+            }
+            return xmlProblem
+        }
+    }
 
     fun loadInstalledApps() {
         if (installed.isNotEmpty()) return
@@ -77,8 +113,10 @@ class DecompilerViewModel(app: Application) : AndroidViewModel(app) {
                     closeJadx()
                     File(ctx.cacheDir, "input.apk").also { copyTo(it) }
                 }
+                apkFile = file
                 stage = Stage.Loading("Parsing DEX & menyusun daftar class… (APK besar bisa lama)")
-                val (d, map) = withContext(Dispatchers.Default) {
+                val (d, map, problem) = withContext(Dispatchers.Default) {
+                    val xmlProblem = xmlSecurityProblem()
                     val args = JadxArgs()
                     args.setInputFile(file)
                     args.setOutDir(File(ctx.cacheDir, "jadx_out").apply { mkdirs() })
@@ -86,14 +124,17 @@ class DecompilerViewModel(app: Application) : AndroidViewModel(app) {
                     args.setDebugInfo(false)
                     args.setShowInconsistentCode(true)
                     args.setDeobfuscationOn(false)
+                    // Kalau parser XML jadx tidak jalan di Android, lewati pemrosesan resource.
+                    args.setSkipResources(xmlProblem != null)
                     val dec = JadxDecompiler(args)
                     dec.load()
                     val m = dec.classes.sortedBy { it.fullName }.associateBy { it.fullName }
-                    dec to m
+                    Triple(dec, m, xmlProblem)
                 }
                 jadx = d
                 classMap = map
                 classNames = map.keys.toList()
+                xmlWarning = problem
                 openedTitle = null
                 openedCode = null
                 stage = Stage.Browse
@@ -101,7 +142,7 @@ class DecompilerViewModel(app: Application) : AndroidViewModel(app) {
                 closeJadx()
                 stage = Stage.Error(
                     if (t is OutOfMemoryError) "Memori habis. APK terlalu besar untuk di-load penuh."
-                    else "${t.javaClass.simpleName}: ${t.message}"
+                    else describe(t)
                 )
             }
         }
@@ -114,25 +155,29 @@ class DecompilerViewModel(app: Application) : AndroidViewModel(app) {
         codeLoading = true
         viewModelScope.launch {
             val code = withContext(Dispatchers.Default) {
-                try { cls.code } catch (t: Throwable) { "// Gagal decompile class ini:\n// $t" }
+                try {
+                    cls.code
+                } catch (t: Throwable) {
+                    "// Gagal decompile class ini:\n" + describe(t).lines().joinToString("\n") { "// $it" }
+                }
             }
             openedCode = code
             codeLoading = false
         }
     }
 
+    /** Manifest di-decode pakai decoder sendiri (tidak lewat jadx). */
     fun openManifest() {
-        val d = jadx ?: return
+        val f = apkFile ?: return
         openedTitle = "AndroidManifest.xml"
         openedCode = null
         codeLoading = true
         viewModelScope.launch {
-            val text = withContext(Dispatchers.Default) {
+            val text = withContext(Dispatchers.IO) {
                 try {
-                    val res = d.resources.firstOrNull { it.type == ResourceType.MANIFEST }
-                    res?.loadContent()?.text?.codeStr ?: "<!-- Manifest tidak ditemukan -->"
+                    ManifestDecoder.decode(f)
                 } catch (t: Throwable) {
-                    "<!-- Gagal decode manifest: $t -->"
+                    "<!-- Gagal decode manifest:\n${describe(t)}-->"
                 }
             }
             openedCode = text
@@ -150,6 +195,7 @@ class DecompilerViewModel(app: Application) : AndroidViewModel(app) {
         closeFile()
         closeJadx()
         classNames = emptyList()
+        xmlWarning = null
         stage = Stage.Home
     }
 

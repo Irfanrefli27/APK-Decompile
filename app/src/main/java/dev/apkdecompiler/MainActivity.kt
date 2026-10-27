@@ -27,6 +27,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -169,10 +170,21 @@ private fun LoadingScreen(message: String) {
 
 @Composable
 private fun ErrorScreen(message: String, onBack: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Gagal", style = MaterialTheme.typography.headlineSmall)
-        Text(message, color = MaterialTheme.colorScheme.error)
-        Button(onClick = onBack) { Text("Kembali") }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onBack) { Text("Kembali") }
+            OutlinedButton(onClick = { clipboard.setText(AnnotatedString(message)) }) {
+                Text("Salin detail error")
+            }
+        }
+        Text(
+            message,
+            Modifier.weight(1f).verticalScroll(rememberScrollState()),
+            color = MaterialTheme.colorScheme.error,
+            fontFamily = FontFamily.Monospace, fontSize = 11.sp
+        )
     }
 }
 
@@ -191,6 +203,18 @@ private fun BrowseScreen(vm: DecompilerViewModel) {
             )
             TextButton(onClick = vm::openManifest) { Text("Manifest") }
             TextButton(onClick = vm::goHome) { Text("Tutup") }
+        }
+        vm.xmlWarning?.let { w ->
+            val clipboard = LocalClipboardManager.current
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Mode tanpa resource: XML parser jadx gagal init di HP ini.",
+                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+                TextButton(onClick = { clipboard.setText(AnnotatedString(w)) }) { Text("Salin detail") }
+            }
         }
         OutlinedTextField(
             value = query, onValueChange = { query = it }, singleLine = true,
